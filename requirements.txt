@@ -1,0 +1,13 @@
+flask
+requests
+python-dotenv
+openai>=1.51.0
+beautifulsoup4
+readability-lxml
+playwright
+beautifulsoup4
+playwright
+bs4
+pillow
+pypdf
+redis

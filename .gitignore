@@ -1,0 +1,18 @@
+# Ambientes virtuais
+.venv/
+
+# Arquivos de ambiente
+.env
+
+# Notas locais
+.notes/
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.notes.md
+instructions.md
+AGENTS.md

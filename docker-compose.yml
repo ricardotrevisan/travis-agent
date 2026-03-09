@@ -69,12 +69,11 @@ services:
     expose:
       - "5432"
 
-  agent:
+  travis:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: evolution_whats_agent
-    image: local/whats-evolution-agent:latest
+    container_name: travis
     restart: unless-stopped
     depends_on:
       - api

@@ -45,6 +45,11 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "agent")
+ALLOWED_WHATSAPP_NUMBERS = {
+    re.sub(r"\D", "", item)
+    for item in os.getenv("ALLOWED_WHATSAPP_NUMBERS", "").split(",")
+    if re.sub(r"\D", "", item)
+}
 
 openai_client = (
     OpenAI(
@@ -85,6 +90,15 @@ def extract_tool_calls(response: Any) -> List[Any]:
     return calls
 
 
+def get_tool_call_id(call: Any) -> str:
+    return (
+        getattr(call, "call_id", "")
+        or _get(call, "call_id", "")
+        or getattr(call, "id", "")
+        or _get(call, "id", "")
+    )
+
+
 def extract_output_text(response: Any) -> Optional[str]:
     txt = _get(response, "output_text")
     if txt:
@@ -104,29 +118,17 @@ def extract_output_text(response: Any) -> Optional[str]:
     return None
 
 
-def clamp_tool_context(text: str, max_chars: int = MAX_TOOL_CONTEXT_CHARS) -> str:
-    if not text or len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n...[conteúdo truncado]"
-
-
 def extract_urls(text: str) -> List[str]:
     if not text:
         return []
     return re.findall(r"https?://\S+", text)
 
 
-def format_search_bullets(results: List[Dict[str, str]], limit: int = 3) -> str:
-    limited = results[:limit]
-    bullets = []
-    for r in limited:
-        title = (r.get("title") or r.get("url") or "").strip()
-        url = r.get("url", "").strip()
-        snippet = (r.get("snippet") or "").strip()
-        snippet = snippet[:220] + ("..." if len(snippet) > 220 else "")
-        parts = [p for p in [title, url, snippet] if p]
-        bullets.append(" • ".join(parts))
-    return "\n".join(f"- {b}" for b in bullets if b)
+def normalize_whatsapp_number(value: str) -> str:
+    if not value:
+        return ""
+    base = value.split("@", 1)[0]
+    return re.sub(r"\D", "", base)
 
 
 def log_tool_calls(response: Any, prefix: str = "[Responses]"):
@@ -141,14 +143,16 @@ def log_tool_calls(response: Any, prefix: str = "[Responses]"):
             name = getattr(func, "name", "") or _get(func, "name", "")
             raw = getattr(func, "arguments", "") or _get(func, "arguments", "") or "{}"
             trimmed = raw[:400] + ("...<trunc>" if len(raw) > 400 else "")
-            print(f"{prefix} required_call #{idx}: name={name} args={trimmed}")
+            call_id = getattr(call, "call_id", "") or _get(call, "call_id", "") or getattr(call, "id", "") or _get(call, "id", "")
+            print(f"{prefix} required_call #{idx}: id={call_id} name={name} args={trimmed}")
 
         for item in _get(response, "output", []) or []:
             if _get(item, "type") in ("function_call", "function_tool_call"):
                 name = _get(item, "name", "")
                 raw = _get(item, "arguments", "") or ""
                 trimmed = raw[:400] + ("...<trunc>" if len(raw) > 400 else "")
-                print(f"{prefix} output_call: name={name} args={trimmed}")
+                call_id = _get(item, "call_id", "") or _get(item, "id", "")
+                print(f"{prefix} output_call: id={call_id} name={name} args={trimmed}")
 
     except Exception as exc:
         print(f"{prefix} erro ao logar: {exc}")
@@ -237,6 +241,14 @@ class AgentEngine:
             print(f"[redis] erro get {key}: {exc}")
             return None
 
+    def _redis_delete(self, key: str):
+        if not self.redis:
+            return
+        try:
+            self.redis.delete(key)
+        except Exception as exc:
+            print(f"[redis] erro delete {key}: {exc}")
+
     def _load_user_state(self, sender: str):
         if not self.redis:
             return
@@ -301,6 +313,22 @@ class AgentEngine:
             self.image_memory.pop(oldest_sender, None)
             self.pdf_memory.pop(oldest_sender, None)
             print(f"[debug] LRU evict user={oldest_sender}")
+
+    def reset_session(self, sender: str):
+        self.conversations.pop(sender, None)
+        self.session_summaries.pop(sender, None)
+        self.image_memory.pop(sender, None)
+        self.pdf_memory.pop(sender, None)
+        self.user_order.pop(sender, None)
+
+        for suffix in ("conversation", "summary", "image", "pdf"):
+            self._redis_delete(self._redis_key(sender, suffix))
+
+    def is_allowed_sender(self, sender: str) -> bool:
+        if not ALLOWED_WHATSAPP_NUMBERS:
+            return True
+        normalized_sender = normalize_whatsapp_number(sender)
+        return normalized_sender in ALLOWED_WHATSAPP_NUMBERS
 
     def _format_turns(self, turns: List[Dict[str, str]]) -> str:
         parts: List[str] = []
@@ -412,7 +440,71 @@ class AgentEngine:
         if not tool:
             return {"error": f"Ferramenta desconhecida: {name}"}
 
-        return tool.run(args)
+        try:
+            result = tool.run(args)
+        except Exception as exc:
+            print(f"[tool:{name}] erro: {exc}")
+            return {"error": str(exc), "tool": name}
+
+        if result is None:
+            return {"error": f"A ferramenta {name} retornou vazio.", "tool": name}
+        if isinstance(result, (dict, list, str, int, float, bool)):
+            return result
+        return {"result": str(result), "tool": name}
+
+    def _create_initial_response(self, full_input: str) -> Any:
+        return self.client.responses.create(
+            model=RESPONSES_MODEL,
+            instructions=(
+                "Você é um agente multimodal especializado em resolver problemas e análises com base em texto do usuário, "
+                "URLs fornecidas, imagens recebidas e PDFs internos disponíveis. "
+                "Seu foco é utilidade imediata, assertividade e execução precisa das ferramentas. "
+                "REGRAS GERAIS: "
+                "Nunca peça confirmação para executar uma tool. "
+                "Nunca ofereça opções de fluxo, formatos ou métodos. "
+                "Nunca pergunte preferências. "
+                "Nunca faça follow-ups desnecessários. "
+                "Nunca revele caminhos internos, nomes de arquivos ou lógica interna. "
+                "Priorize agir, não perguntar. "
+                "PDF: "
+                "Se existir PDF disponível internamente, execute pdf_extract imediatamente e extraia o conteúdo completo. "
+                "Nunca peça autorização nem pergunte o formato. "
+                "IMAGENS: "
+                "Se houver imagem associada à conversa, utilize OCR automaticamente quando relevante, usando ocr_image. "
+                "Não pergunte ao usuário se ele quer OCR. "
+                "URLs: "
+                "Se o usuário fornecer uma URL, use summarize_url para análise de conteúdo. "
+                "Use web_search apenas quando o usuário pedir busca ou investigação explícita. "
+                "Nunca pergunte qual ferramenta ele prefere. "
+                "GERAÇÃO DE IMAGEM: "
+                "Se o usuário pedir uma imagem, use generate_image imediatamente. "
+                "RACIOCÍNIO: "
+                "Responda sempre de forma direta ao pedido principal. "
+                "Se uma ferramenta falhar, use o erro retornado para responder ao usuário de forma objetiva e útil. "
+                "Priorize o uso da tool apropriada sempre que aplicável. "
+                "Sem etapas intermediárias, sem hesitação: aja."
+            ),
+            input=full_input,
+            max_output_tokens=2048,
+            tools=self.tool_schemas,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            metadata={"source": "evolution_agent"},
+            reasoning={"effort": "minimal"},
+        )
+
+    def _continue_with_tool_outputs(self, previous_response_id: str, tool_outputs: List[Dict[str, Any]]) -> Any:
+        return self.client.responses.create(
+            model=RESPONSES_MODEL,
+            previous_response_id=previous_response_id,
+            input=tool_outputs,
+            max_output_tokens=2048,
+            tools=self.tool_schemas,
+            tool_choice="auto",
+            parallel_tool_calls=True,
+            metadata={"source": "evolution_agent"},
+            reasoning={"effort": "minimal"},
+        )
 
     # ---------------------------------------------------------------
     def respond(
@@ -434,249 +526,39 @@ class AgentEngine:
 
             history = self.conversations.get(sender, [])
             history_text = self._build_history_text(sender)
-            urls_in_message = extract_urls(user_message)
 
             full_input = (
                 (history_text + "\n") if history_text else ""
             ) + f"Usuário: {user_message}\nAssistente:"
 
-            # -----------------------------------------------------------
-            # PRIMEIRA RODADA
-            # -----------------------------------------------------------
-            response1 = self.client.responses.create(
-                model=RESPONSES_MODEL,
-                instructions=(
-                    "Você é um agente multimodal especializado em resolver problemas e análises com base em texto do usuário, "
-                    "URLs fornecidas, imagens recebidas e PDFs internos disponíveis. "
-                    "Seu foco é utilidade imediata, assertividade e execução precisa das ferramentas. "
+            response = self._create_initial_response(full_input)
+            log_tool_calls(response, "[Responses rodada 1]")
 
-                    "REGRAS GERAIS: "
-                    "Nunca peça confirmação para executar uma tool. "
-                    "Nunca ofereça opções de fluxo, formatos ou métodos. "
-                    "Nunca pergunte preferências. "
-                    "Nunca faça follow-ups desnecessários. "
-                    "Nunca revele caminhos internos, nomes de arquivos ou lógica interna. "
-                    "Priorize agir, não perguntar. "
+            round_idx = 1
+            while True:
+                tool_calls = extract_tool_calls(response)
+                if not tool_calls:
+                    break
 
-                    "PDF: "
-                    "Se existir PDF disponível internamente, execute pdf_extract imediatamente e extraia o conteúdo completo. "
-                    "Nunca peça autorização nem pergunte o formato. "
-
-                    "IMAGENS: "
-                    "Se houver imagem associada à conversa, utilize OCR automaticamente quando relevante, usando ocr_image. "
-                    "Não pergunte ao usuário se ele quer OCR. "
-
-                    "URLs: "
-                    "Se o usuário fornecer uma URL, use summarize_url para análise de conteúdo. "
-                    "Use web_search apenas quando o usuário pedir busca ou investigação explícita. "
-                    "Nunca pergunte qual ferramenta ele prefere. "
-
-                    "GERAÇÃO DE IMAGEM: "
-                    "Se o usuário pedir uma imagem, use generate_image imediatamente. "
-
-                    "RACIOCÍNIO: "
-                    "Responda sempre de forma direta ao pedido principal. "
-                    "Priorize o uso da tool apropriada sempre que aplicável. "
-                    "Sem etapas intermediárias, sem hesitação: aja."
-                ),
-                input=full_input,
-                max_output_tokens=2048,
-                tools=self.tool_schemas,
-                tool_choice="auto",
-                parallel_tool_calls=True,
-                metadata={"source": "evolution_agent"},
-                reasoning={"effort": "minimal"},
-            )
-
-            log_tool_calls(response1, "[Primeira rodada]")
-
-            tool_calls = extract_tool_calls(response1)
-
-            # -----------------------------------------------------------
-            # SEGUNDA RODADA (se houver tools)
-            # -----------------------------------------------------------
-            if tool_calls or urls_in_message:
-                search_chunks: List[Dict[str, Any]] = []
-                image_chunks: List[Dict[str, Any]] = []
-                summary_chunks: List[Dict[str, Any]] = []
-                ocr_chunks: List[Dict[str, Any]] = []
-                ocr_texts: List[str] = []
-                pdf_texts: List[str] = []
-
+                tool_outputs: List[Dict[str, Any]] = []
                 for call in tool_calls:
                     result = self._run_tool_call(call, sender)
-                    tool_name = (
-                        _get(call, "name")
-                        or _get(_get(call, "function", {}), "name")
+                    call_id = get_tool_call_id(call)
+                    if not call_id:
+                        raise RuntimeError("Tool call sem call_id retornado pela Responses API.")
+                    tool_outputs.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(result, ensure_ascii=False),
+                        }
                     )
 
-                    if tool_name == "web_search":
-                        search_chunks.append(result)
-                    elif tool_name == "generate_image":
-                        image_chunks.append(result)
-                    elif tool_name == "summarize_url":
-                        summary_chunks.append(result)
-                    elif tool_name == "ocr_image":
-                        ocr_chunks.append(result)
-                    elif tool_name == "pdf_extract":
-                        summary_chunks.append(result)
-                    else:
-                        search_chunks.append(result)
+                round_idx += 1
+                response = self._continue_with_tool_outputs(_get(response, "id"), tool_outputs)
+                log_tool_calls(response, f"[Responses rodada {round_idx}]")
 
-                # -------------------------------------------------------
-                # Contexto de busca
-                # -------------------------------------------------------
-                flat = []
-                for chunk in search_chunks:
-                    flat.extend(chunk.get("results", []))
-                bullets = format_search_bullets(flat, limit=SEARCH_MAX_RESULTS)
-
-                search_context = (
-                    "Contexto da busca:\n" + (bullets or "Nenhum resultado encontrado.")
-                )
-
-                # -------------------------------------------------------
-                # Contexto de imagens geradas
-                # -------------------------------------------------------
-                image_context = ""
-                if image_chunks:
-                    lines = []
-                    for c in image_chunks:
-                        if c.get("error"):
-                            lines.append(f"- Erro: {c['error']}")
-                        else:
-                            lines.append(
-                                f"- Prompt: {c.get('prompt')} | Arquivos: {', '.join(c.get('files', []))}"
-                            )
-                    image_context = "Imagens geradas:\n" + "\n".join(lines)
-
-                # -------------------------------------------------------
-                # Contexto de resumos (URL + PDF)
-                # -------------------------------------------------------
-                summary_context = ""
-                local_summaries: List[str] = []
-                html_sections: List[str] = []
-
-                for chunk in summary_chunks:
-                    if chunk.get("error"):
-                        summary_context += f"[Resumo-erro] {chunk.get('source')}: {chunk.get('error')}\n"
-                        continue
-
-                    if chunk.get("content"):
-                        summary_context += (
-                            f"[PDF] {chunk.get('source') or 'arquivo'}:\n"
-                            f"{chunk.get('content')}\n"
-                        )
-                        if chunk.get("content"):
-                            pdf_texts.append(chunk["content"])
-                        continue
-
-                    summary_context += (
-                        f"- {chunk.get('title') or 'Sem título'} ({chunk.get('source')}) "
-                        f"{(chunk.get('summary') or '')[:280]}...\n"
-                    )
-
-                    if chunk.get("local_summary"):
-                        local_summaries.append(chunk["local_summary"])
-
-                    if chunk.get("raw_html"):
-                        html_sections.append(f"[HTML]\n{chunk.get('raw_html')}")
-
-                summary_html_context = clamp_tool_context("\n\n".join(html_sections))
-
-                # -------------------------------------------------------
-                # Contexto de OCR
-                # -------------------------------------------------------
-                ocr_context = ""
-                if ocr_chunks:
-                    ocr_lines = []
-                    for chunk in ocr_chunks:
-                        if chunk.get("error"):
-                            ocr_lines.append(f"[OCR-erro] {chunk['error']}")
-                        else:
-                            t = (chunk.get("ocr_text") or "").strip()
-                            if t:
-                                ocr_texts.append(t)
-                            ocr_lines.append(
-                                f"[OCR]\n{t}" if t else "[OCR] Nenhum texto encontrado."
-                            )
-                    ocr_context = "\n".join(ocr_lines)
-
-                enriched_context = "\n".join(
-                    p
-                    for p in [
-                        search_context,
-                        image_context,
-                        summary_context,
-                        "\n".join(local_summaries),
-                        summary_html_context,
-                        ocr_context,
-                    ]
-                    if p
-                )
-
-                second_input = (
-                    full_input
-                    + "\n[Contexto das ferramentas]\n"
-                    + enriched_context
-                    + "\nAssistente:"
-                )
-
-                response2 = self.client.responses.create(
-                    model=RESPONSES_MODEL_SECOND,
-                    instructions=(
-                        "Produza apenas a resposta final ao usuário com base no contexto fornecido. "
-                        "Não execute ferramentas. "
-                        "Não sugira ferramentas. "
-                        "Não peça confirmação. "
-                        "Não ofereça opções. "
-                        "Use diretamente o conteúdo presente nos blocos de contexto "
-                        "(OCR, PDF, buscas, resumos, HTML ou imagens). "
-                        "Se houver bloco [OCR], ele é prioritário para extração textual. "
-                        "Se houver conteúdo de PDF, trate como texto fornecido. "
-                        "Se houver resultados de busca ou resumos, use-os para fundamentar a resposta. "
-                        "Responda de forma objetiva, direta e completa, em até ~3000 tokens. "
-                        "Nenhuma etapa adicional. Apenas a resposta final."
-                    ),
-                    input=second_input,
-                    max_output_tokens=3000,
-                    tools=[],
-                    tool_choice="none",
-                    metadata={"source": "evolution_agent"},
-                    reasoning={"effort": "minimal"},
-                )
-
-                log_tool_calls(response2, "[Segunda rodada]")
-                if _get(response2, "status") != "completed":
-                    inc_details = _get(response2, "incomplete_details")
-                    preview = extract_output_text(response2) or ""
-                    if len(preview) > 300:
-                        preview = preview[:300] + "..."
-                    print(
-                        f"[Segunda rodada] incomplete status={_get(response2, 'status')} "
-                        f"details={inc_details} output_preview={preview}"
-                    )
-                final_response = response2
-
-            else:
-                final_response = response1
-
-            # -----------------------------------------------------------
-            # Extração do texto final
-            # -----------------------------------------------------------
-            if _get(final_response, "status") != "completed":
-                # Se já temos texto extraído de PDF, devolve-o mesmo se o modelo falhar
-                if pdf_texts:
-                    reply_text = pdf_texts[0]
-                elif ocr_texts:
-                    reply_text = ocr_texts[0]
-                else:
-                    reply_text = "Desculpe, não consegui gerar uma resposta agora."
-            else:
-                reply_text = (
-                    extract_output_text(final_response)
-                    or "Desculpe, sem resposta no momento."
-                )
+            reply_text = extract_output_text(response) or "Desculpe, sem resposta no momento."
 
             # -----------------------------------------------------------
             # Memória curta
@@ -738,9 +620,18 @@ class AgentEngine:
             msg = data.get("message") or {}
             key = data.get("key") or {}
             sender = key.get("remoteJid")
+            from_me = bool(key.get("fromMe"))
 
             if not sender:
                 print("[handle_inbound_whatsapp] sender ausente")
+                return ""
+
+            if from_me:
+                print("[handle_inbound_whatsapp] ignorando mensagem fromMe:", sender)
+                return ""
+
+            if not self.is_allowed_sender(sender):
+                print("[handle_inbound_whatsapp] sender fora da allowlist:", sender)
                 return ""
 
             # Reconstruir WebMessageInfo para o endpoint de mídia
@@ -819,6 +710,12 @@ class AgentEngine:
                     or msg.get("text", {}).get("body")
                     or ""
                 )
+
+            if user_message.strip().lower() == "/new":
+                self.reset_session(sender)
+                reply_text = "Sessao resetada. Contexto anterior limpo."
+                send_text(sender, reply_text, instance_name)
+                return reply_text
 
             # Atualiza memória de mídia
             self.ingest_media(sender, image_b64=image_b64, pdf_b64=pdf_b64)

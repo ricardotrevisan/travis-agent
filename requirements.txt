@@ -1,0 +1,13 @@
+flask
+requests
+python-dotenv
+openai>=1.51.0
+beautifulsoup4
+readability-lxml
+playwright
+pillow
+pypdf
+redis
+garminconnect
+garth
+mcp>=1,<2

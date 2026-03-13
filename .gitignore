@@ -1,0 +1,19 @@
+# Ambientes virtuais
+.venv/
+
+# Arquivos de ambiente
+.env
+.garminconnect/
+
+# Notas locais
+.notes/
+
+# Cache do Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.notes*
+instructions.md
+AGENTS.md

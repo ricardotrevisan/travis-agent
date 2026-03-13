@@ -1,0 +1,102 @@
+version: "3.9"
+
+services:
+  api:
+    container_name: evolution_api
+    image: evoapicloud/evolution-api:latest
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - evolution-postgres
+    ports:
+      - "127.0.0.1:8080:8080"
+    extra_hosts:
+      - "agent:host-gateway"
+    volumes:
+      - evolution_instances:/evolution/instances
+    env_file:
+      - .env
+    environment:
+      DATABASE_PROVIDER: ${DATABASE_PROVIDER:-postgresql}
+      DATABASE_CONNECTION_URI: ${DATABASE_CONNECTION_URI:-postgresql://${EVOLUTION_POSTGRES_USERNAME:-postgres}:${EVOLUTION_POSTGRES_PASSWORD:-postgres}@evolution-postgres:5432/${EVOLUTION_POSTGRES_DATABASE:-evolution_api}}
+      DATABASE_CONNECTION_CLIENT_NAME: ${DATABASE_CONNECTION_CLIENT_NAME:-evolution_exchange}
+      CACHE_REDIS_ENABLED: ${CACHE_REDIS_ENABLED:-true}
+      CACHE_REDIS_URI: ${CACHE_REDIS_URI:-redis://evolution-redis:6379}
+      CACHE_REDIS_TTL: ${CACHE_REDIS_TTL:-604800}
+      CACHE_REDIS_PREFIX_KEY: ${CACHE_REDIS_PREFIX_KEY:-evolution}
+      CACHE_REDIS_SAVE_INSTANCES: ${CACHE_REDIS_SAVE_INSTANCES:-false}
+      CACHE_LOCAL_ENABLED: ${CACHE_LOCAL_ENABLED:-false}
+    networks:
+      - evolution-net
+
+  redis:
+    container_name: evolution_redis
+    image: redis:latest
+    restart: unless-stopped
+    command: >
+      redis-server --port 6379 --appendonly yes
+    volumes:
+      - evolution_redis:/data
+    networks:
+      evolution-net:
+        aliases:
+          - evolution-redis
+    expose:
+      - "6379"
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
+
+  evolution-postgres:
+    container_name: evolution_postgres
+    image: postgres:15
+    restart: unless-stopped
+    env_file:
+      - .env
+    command:
+      - postgres
+      - -c
+      - max_connections=1000
+      - -c
+      - listen_addresses=*
+    environment:
+      POSTGRES_DB: ${EVOLUTION_POSTGRES_DATABASE:-evolution_api}
+      POSTGRES_USER: ${EVOLUTION_POSTGRES_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${EVOLUTION_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - evolution_postgres_data:/var/lib/postgresql/data
+    networks:
+      - evolution-net
+    expose:
+      - "5432"
+
+  travis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: travis
+    restart: unless-stopped
+    depends_on:
+      - api
+    env_file:
+      - .env
+    volumes:
+      - ${GARMINTOKENS_HOST_PATH:-/home/trevisan/.garminconnect}:/garmin_tokens:ro
+    ports:
+      - "5000:5000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - evolution-net
+
+volumes:
+  evolution_instances:
+    name: python-ai-whatsapp-chat_evolution_instances
+  evolution_redis:
+    name: python-ai-whatsapp-chat_evolution_redis
+  evolution_postgres_data:
+    name: python-ai-whatsapp-chat_postgres_data
+
+networks:
+  evolution-net:
+    name: evolution-net
+    driver: bridge

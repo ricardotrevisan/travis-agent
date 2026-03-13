@@ -29,12 +29,19 @@ def _parse_json_object(raw: str) -> dict[str, Any] | None:
 
 
 def _classify_needs_current_info_llm(ctx: RequestContext) -> bool | None:
+    history_snippet = ""
+    if ctx.history:
+        lines = []
+        for m in ctx.history[-4:]:  # last 2 turns for classifier context
+            lines.append(f'{m["role"]}: {m["content"][:200]}')
+        history_snippet = "\nContexto recente:\n" + "\n".join(lines) + "\n"
     classifier_prompt = (
         "Classifique se o pedido do usuário depende de informação externa atual.\n"
         "Responda APENAS JSON puro no formato:\n"
         '{"needs_current_info": true|false}\n'
         "Use true quando precisar de fatos de hoje/agora/recente, mercado, notícias, placar, tempo, cotações ou status atual.\n"
         "Use false para pedido conceitual, explicação atemporal, opinião, escrita ou reformulação.\n"
+        f"{history_snippet}"
         f"Pedido do usuário: {ctx.user_text}\n"
     )
     try:
@@ -83,6 +90,7 @@ def _build_prompt(
             "has_url": has_url,
             "needs_current_info": needs_current_info,
             "urls": ctx.urls[:3],
+            "recent_history": ctx.history[-6:] if ctx.history else [],
         },
         "available_skills": available_skills,
         "rules": [
@@ -90,7 +98,7 @@ def _build_prompt(
             "Quando usar n8n_schedule_alert, sempre inclua args.action com um de: create, list, delete.",
             "Para create em n8n_schedule_alert, inclua args.run_at com o datetime ISO 8601 extraído do pedido (ex: 2026-03-12T19:28:00).",
             "Para delete, inclua args.idTask quando já houver id explícito no pedido.",
-            "Use garmin_tracking quando o usuário pedir por garmin ou update/atualização/dados de treino/atividade/histórico/agenda do Garmin.",
+            "Use garmin_tracking quando o usuário pedir por garmin ou update/atualização/dados de treino/atividade/histórico/agenda do Garmin. Os únicos args válidos são start_date e end_date (formato YYYY-MM-DD), ambos opcionais. Não invente outros args.",
             "Use summarize_url quando houver URL explícita.",
             "Use web_search quando depender de informação externa atual.",
             "Use direct_answer nos demais casos.",

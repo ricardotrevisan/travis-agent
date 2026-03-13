@@ -17,18 +17,12 @@ class DirectAnswerSkill(BaseSkill):
 
     def run(self, ctx: RequestContext, args: dict[str, Any]) -> SkillResult:
         try:
+            messages = [{"role": "system", "content": build_system_persona(channel="text")}]
+            messages.extend(ctx.history)
+            messages.append({"role": "user", "content": ctx.user_text})
             response = client.responses.create(
                 model=MODEL,
-                input=[
-                    {
-                        "role": "system",
-                        "content": build_system_persona(channel="text"),
-                    },
-                    {
-                        "role": "user",
-                        "content": ctx.user_text,
-                    },
-                ],
+                input=messages,
             )
             text = (response.output_text or "").strip()
             if not text:

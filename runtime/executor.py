@@ -95,7 +95,8 @@ def _maybe_interpret_with_llm(
     last_result: SkillResult | None,
     fallback_text: str,
 ) -> str:
-    if any(step.skill == "n8n_schedule_alert" for step in plan.steps):
+    _SKILLS_WITH_OWN_OUTPUT = {"n8n_schedule_alert", "garmin_tracking", "gmail_list"}
+    if any(step.skill in _SKILLS_WITH_OWN_OUTPUT for step in plan.steps):
         return fallback_text
     enabled = (os.getenv("FINAL_INTERPRETER_ENABLED") or "").strip().lower()
     if enabled not in {"1", "true", "yes", "on"}:
@@ -128,9 +129,12 @@ def _maybe_interpret_with_llm(
     )
     try:
         client = OpenAI(api_key=api_key)
+        messages: list[dict] = []
+        messages.extend(ctx.history)
+        messages.append({"role": "user", "content": prompt})
         response = client.responses.create(
             model=model,
-            input=[{"role": "user", "content": prompt}],
+            input=messages,
         )
         text = (response.output_text or "").strip()
         return text or fallback_text

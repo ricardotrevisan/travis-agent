@@ -5,6 +5,7 @@ from runtime.context_builder import build_request_context
 from runtime.models import RequestContext
 from runtime.executor import execute_plan, validate_plan
 from runtime.planner import plan as build_plan
+from runtime.session_store import append_turn, clear_history, get_history
 from skills.registry import SkillRegistry
 from skills.mcp_tools import invalidate_mcp_tools_cache
 
@@ -105,10 +106,13 @@ def handle_webhook_v2(
     if ctx.user_text.strip().lower() == "/new":
         _reset_registry()
         invalidate_mcp_tools_cache()
+        clear_history(ctx.sender)
         response_text = "Sessao resetada. Contexto anterior limpo."
         print(f"[v2.orchestrator] session_reset sender={ctx.sender}")
         send_text(ctx.sender, response_text, instance_name)
         return response_text
+
+    ctx.history = get_history(ctx.sender)
 
     trace: dict[str, Any] = {
         "sender": ctx.sender,
@@ -133,6 +137,7 @@ def handle_webhook_v2(
             send_text(ctx.sender, response_text, instance_name)
         trace["results"] = [{"skill": "direct_answer", "ok": response_text != FALLBACK_TEXT}]
         print(f"[v2.trace] {json.dumps(trace, ensure_ascii=False)}")
+        append_turn(ctx.sender, ctx.user_text, response_text)
         return response_text
 
     exec_result = execute_plan(ctx, plan, registry)
@@ -143,6 +148,7 @@ def handle_webhook_v2(
             print(f"[v2.orchestrator] send_text mode=plan_success text_len={len(response_text)}")
             send_text(ctx.sender, response_text, instance_name)
         print(f"[v2.trace] {json.dumps(trace, ensure_ascii=False)}")
+        append_turn(ctx.sender, ctx.user_text, response_text)
         return response_text
 
     print(f"[v2.orchestrator] planner_fallback reason=execution_failed err={exec_result.get('error')}")
@@ -151,7 +157,6 @@ def handle_webhook_v2(
         print(f"[v2.orchestrator] send_text mode=fallback2 text_len={len(response_text)}")
         send_text(ctx.sender, response_text, instance_name)
 
-    # Fallback nível 2 já é aplicado dentro de _run_direct_answer_fallback.
     trace["results"].append(
         {
             "skill": "direct_answer",
@@ -160,4 +165,5 @@ def handle_webhook_v2(
         }
     )
     print(f"[v2.trace] {json.dumps(trace, ensure_ascii=False)}")
+    append_turn(ctx.sender, ctx.user_text, response_text)
     return response_text

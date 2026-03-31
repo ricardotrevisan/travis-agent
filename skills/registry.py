@@ -2,6 +2,7 @@ from skills.base import BaseSkill
 from skills.direct_answer import DirectAnswerSkill
 from skills.garmin_tracking import GarminTrackingSkill
 from skills.gmail_list import GmailListSkill
+from skills.mfp_tracking import MFPTrackingSkill
 from skills.n8n_schedule_alert import N8NScheduleAlertSkill
 from skills.summarize_url import SummarizeURLSkill
 from skills.voice_note_reply import VoiceNoteReplySkill
@@ -15,6 +16,7 @@ class SkillRegistry:
             "direct_answer": DirectAnswerSkill(),
             "garmin_tracking": GarminTrackingSkill(),
             "gmail_list": GmailListSkill(),
+            "mfp_tracking": MFPTrackingSkill(),
             "n8n_schedule_alert": N8NScheduleAlertSkill(),
             "web_search": WebSearchSkill(),
             "summarize_url": SummarizeURLSkill(),

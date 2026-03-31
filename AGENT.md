@@ -73,6 +73,25 @@ Use this file to quickly reload operational context before edits.
   - n8n response without `idTask`: warn user explicitly instead of false success message.
   - `n8n_schedule_alert` steps bypass the final LLM interpreter in executor.
 
+## MFP Tracking Capability
+- Skill: `skills/mfp_tracking.py`
+- Planner visibility: enabled.
+- Planner arg contract:
+  - `start_date`: YYYY-MM-DD (optional)
+  - `end_date`: YYYY-MM-DD (optional, defaults to today)
+- Date resolution order:
+  1. explicit `args.start_date` / `args.end_date`
+  2. incremental from `last_success_end_date` in Redis sync state
+  3. backfill: last `MFP_BACKFILL_DAYS` days (default 7)
+- Session: Playwright cookies persisted in Redis (`agent:v2:mfp:session:{sender}`, TTL 7 days).
+  - Re-login triggered automatically on session expiry.
+  - Requires `MFP_USERNAME` and `MFP_PASSWORD` env vars.
+- `mfp_tracking` steps bypass the final LLM interpreter in executor.
+- Redis keys per sender:
+  - `agent:v2:mfp:session:{sender}` — Playwright cookies
+  - `agent:v2:mfp:sync_state:{sender}` — last sync metadata
+  - `agent:v2:mfp:payload:{sender}` — merged diary payload (days keyed by ISO date)
+
 ## Callback Delivery Endpoint
 - Endpoint: `POST /webhook/task-callback` in `app.py`.
 - Optional auth header: `X-Task-Secret` (checked against `TASK_CALLBACK_SECRET`).

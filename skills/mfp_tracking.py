@@ -270,6 +270,41 @@ def _parse_nutrient_cells(cells: list, col_map: dict[int, str]) -> dict[str, flo
     return nutrients
 
 
+_WATER_ML_PER_CUP = 236.588
+_WATER_ML_PER_FLOZ = 29.5735
+
+
+def _parse_water_ml(soup: BeautifulSoup) -> float:
+    """
+    Extract water intake from the MFP diary page.
+
+    Confirmed structure from live HTML:
+    - Container: <div class="water-glass-container">
+      - Value: <span class="water-value-static">2000</span>
+      - Unit:  <span class="water-unit">ml</span>
+    """
+    container = soup.find(class_="water-glass-container")
+    if not container:
+        return 0.0
+
+    value_el = container.find(class_="water-value-static")
+    if not value_el:
+        return 0.0
+
+    raw_value = _parse_float(value_el.get_text(strip=True))
+    if raw_value <= 0:
+        return 0.0
+
+    unit_el = container.find(class_="water-unit")
+    unit = unit_el.get_text(strip=True).lower() if unit_el else "ml"
+
+    if "fl oz" in unit or "fl. oz" in unit:
+        return round(raw_value * _WATER_ML_PER_FLOZ, 1)
+    if "cup" in unit or "xícar" in unit:
+        return round(raw_value * _WATER_ML_PER_CUP, 1)
+    return raw_value
+
+
 def _parse_diary_html(html: str, diary_date: str) -> DayDiary:
     """
     Parse MFP diary HTML into a DayDiary.
@@ -366,9 +401,9 @@ def _parse_diary_html(html: str, diary_date: str) -> DayDiary:
     if current_meal is not None:
         day.meals.append(current_meal)
 
-    return day
+    day.water_ml = _parse_water_ml(soup)
 
-    return meal
+    return day
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +468,9 @@ def _build_day_text(day: DayDiary) -> str:
         goal_str = f" / {int(goal_val)}{unit}" if goal_val else ""
         pct_str = _fmt_pct(val, goal_val) if goal_val else ""
         lines.append(f"{label:<12} {int(val)}{unit}{goal_str}{pct_str}")
+
+    if day.water_ml > 0:
+        lines.append(f"{'Água':<12} {int(day.water_ml)} ml")
 
     return "\n".join(lines)
 

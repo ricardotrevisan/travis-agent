@@ -95,7 +95,7 @@ def _maybe_interpret_with_llm(
     last_result: SkillResult | None,
     fallback_text: str,
 ) -> str:
-    _SKILLS_WITH_OWN_OUTPUT = {"n8n_schedule_alert", "garmin_tracking", "gmail_list", "mfp_tracking"}
+    _SKILLS_WITH_OWN_OUTPUT = {"n8n_schedule_alert", "garmin_tracking", "gmail_list", "mfp_tracking", "route_planner"}
     if any(step.skill in _SKILLS_WITH_OWN_OUTPUT for step in plan.steps):
         return fallback_text
     enabled = (os.getenv("FINAL_INTERPRETER_ENABLED") or "").strip().lower()

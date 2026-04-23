@@ -8,6 +8,7 @@ from skills.summarize_url import SummarizeURLSkill
 from skills.voice_note_reply import VoiceNoteReplySkill
 from skills.web_search import WebSearchSkill
 from skills.mcp_tools import load_mcp_skills
+from skills.route_planner import RoutePlannerSkill
 
 
 class SkillRegistry:
@@ -22,6 +23,10 @@ class SkillRegistry:
             "summarize_url": SummarizeURLSkill(),
             "voice_note_reply": VoiceNoteReplySkill(),
         }
+        try:
+            self._skills["route_planner"] = RoutePlannerSkill()
+        except Exception as exc:
+            print(f"[v2.registry] route_planner unavailable: {exc}")
         try:
             mcp_skills = load_mcp_skills(set(self._skills.keys()))
             if mcp_skills:

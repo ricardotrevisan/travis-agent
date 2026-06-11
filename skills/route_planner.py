@@ -22,9 +22,14 @@ def _get_redis():
         decode_responses=True,
     )
 
+# TTL curto: a rota fica disponível só o tempo de o usuário pedir o GPX logo
+# em seguida. Mantemos a polyline em resolução máxima, sem decimar — o limite
+# de retenção (não o tamanho) é o que controla o uso do Redis.
+_ROUTE_TTL_SECONDS = 30 * 60
+
 def _save_last_route(sender: str, data: dict) -> None:
     try:
-        _get_redis().setex(f"agent:route:last:{sender}", 86400, json.dumps(data))
+        _get_redis().set(f"agent:route:last:{sender}", json.dumps(data), ex=_ROUTE_TTL_SECONDS)
     except Exception as e:
         print(f"[route_planner] redis save failed: {e}")
 
@@ -41,10 +46,16 @@ class RoutePlannerSkill(BaseSkill):
     description = (
         "Planejar rotas de moto entre dois endereços ou cidades, com paradas de descanso, "
         "postos de abastecimento e pontos de interesse. Usar quando o usuário pedir rota, "
-        "trajeto ou itinerário. Modo padrão: moto. Nunca perguntar sobre meio de transporte. "
+        "trajeto ou itinerário. A viagem é SEMPRE de moto — não existe escolha de meio de "
+        "transporte. Nunca perguntar sobre veículo, modo ou tipo de transporte: assuma moto "
+        "e calcule direto. "
         "action=plan (padrão): calcular rota. "
         "action=gpx: usar SOMENTE quando o usuário pedir explicitamente o arquivo GPX — "
-        "nesse caso não incluir stops nos args, a skill recupera a rota automaticamente."
+        "nesse caso não incluir stops nos args, a skill recupera a rota automaticamente. "
+        "fixed_waypoints: lista ordenada de paradas obrigatórias entre origem e destino — "
+        "pode conter N itens (cidades, endereços, places ou pontos de referência reconhecidos pelo Google Maps). "
+        "Exemplos: ['Campinas'] ou ['Campinas', 'Ribeirão Preto', 'Uberlândia']. "
+        "A ordem da lista define a sequência da viagem."
     )
     enabled = True
     planner_visible = True
@@ -61,10 +72,11 @@ class RoutePlannerSkill(BaseSkill):
         stops = cached.get("stops") or args.get("stops") or []
         origin_str = cached.get("origin") or (args.get("origin") or "").strip()
         destination_str = cached.get("destination") or (args.get("destination") or "").strip()
+        coordinates = cached.get("coordinates") or []
         if not stops or not origin_str or not destination_str:
             return SkillResult(ok=False, user_visible_text="Não encontrei uma rota recente. Peça a rota primeiro e depois solicite o GPX.")
 
-        gpx_bytes = _build_gpx(origin_str, destination_str, stops)
+        gpx_bytes = _build_gpx(origin_str, destination_str, stops, coordinates)
         link = _upload_gpx_to_drive(gpx_bytes, origin_str, destination_str)
         if not link:
             return SkillResult(ok=False, user_visible_text="Não consegui subir o GPX para o Drive. Tente novamente.")
@@ -84,12 +96,14 @@ class RoutePlannerSkill(BaseSkill):
                 user_visible_text="Preciso de origem e destino para planejar a rota. Exemplo: 'rota de São Paulo para Florianópolis'.",
             )
 
-        mode = (args.get("mode") or "car").strip()
         stop_interval_hours: float | None = _to_float(args.get("stop_interval_hours"))
         stop_interval_km: float = _to_float(args.get("stop_interval_km")) or 150.0
         max_stops: int = int(args.get("max_stops") or 4)
         preferences: list[str] = args.get("preferences") or []
-        fixed_waypoint_strs: list[str] = args.get("fixed_waypoints") or []
+        raw_waypoints = args.get("fixed_waypoints") or []
+        if isinstance(raw_waypoints, str):
+            raw_waypoints = [raw_waypoints]
+        fixed_waypoint_strs: list[str] = [w for w in raw_waypoints if isinstance(w, str) and w.strip()]
         fixed_pois_args: list[dict] = args.get("fixed_pois") or []
         fuel_args: dict = args.get("fuel") or {}
         if not fuel_args:
@@ -106,12 +120,17 @@ class RoutePlannerSkill(BaseSkill):
         except Exception as exc:
             return SkillResult(ok=False, user_visible_text=f"Não consegui localizar o destino '{destination_str}'. Tente um nome mais específico.")
 
+        # Waypoints são paradas obrigatórias: se um não geocodifica, falha a rota
+        # inteira (evita também desalinhar índices com fixed_waypoint_strs adiante).
         fixed_waypoint_coords: list[tuple[float, float]] = []
         for wp in fixed_waypoint_strs:
             try:
                 fixed_waypoint_coords.append(geo_client.geocode(wp))
             except Exception:
-                pass  # waypoint não encontrado — ignorar silenciosamente
+                return SkillResult(
+                    ok=False,
+                    user_visible_text=f"Não consegui localizar a parada obrigatória '{wp}'. Use um nome mais específico (cidade + estado) e tente de novo.",
+                )
 
         fixed_poi_coords: list[tuple[tuple[float, float], dict]] = []
         for poi in fixed_pois_args:
@@ -142,10 +161,9 @@ class RoutePlannerSkill(BaseSkill):
         rest_points = geo_client.sample_waypoints(coordinates, total_km, effective_interval_km, total_minutes)
         stops: list[dict[str, Any]] = []
 
-        for i, wp_str in enumerate(fixed_waypoint_strs):
-            coords = fixed_waypoint_coords[i] if i < len(fixed_waypoint_coords) else None
-            if not coords:
-                continue
+        # fixed_waypoint_coords é 1:1 com fixed_waypoint_strs (qualquer falha já
+        # teria abortado a rota acima), então o zip é seguro.
+        for wp_str, coords in zip(fixed_waypoint_strs, fixed_waypoint_coords):
             km = _closest_km(coords, coordinates, total_km)
             stops.append({
                 "type": "waypoint_fixed",
@@ -180,6 +198,7 @@ class RoutePlannerSkill(BaseSkill):
 
         # 6. Paradas de abastecimento
         fuel_stops: list[dict[str, Any]] = []
+        fuel_gaps: list[float] = []  # km onde a autonomia exige posto mas nenhum foi mapeado
         if fuel_args.get("enabled"):
             fuel_interval = float(fuel_args.get("max_interval_km") or 200)
             tank_remaining = float(fuel_args.get("tank_km_remaining") or fuel_interval)
@@ -187,9 +206,15 @@ class RoutePlannerSkill(BaseSkill):
             fuel_categories = ["posto de gasolina"] + [b.lower() for b in fuel_brands]
             fuel_points = geo_client.sample_waypoints(coordinates, total_km, min(fuel_interval, tank_remaining * 0.85), total_minutes)
             for fp in fuel_points:
-                nearby = geo_client.get_pois(fp["lat"], fp["lon"], 5000, fuel_categories)
-                if nearby:
-                    best = nearby[0]
+                # Raio progressivo: não achar posto num ponto exigido pela autonomia
+                # é risco real numa moto, então ampliamos a busca antes de desistir.
+                best = None
+                for radius in (5000, 10000, 15000):
+                    nearby = geo_client.get_pois(fp["lat"], fp["lon"], radius, fuel_categories)
+                    if nearby:
+                        best = nearby[0]
+                        break
+                if best:
                     fuel_stops.append({
                         "type": "fuel",
                         "name": best["name"],
@@ -200,6 +225,8 @@ class RoutePlannerSkill(BaseSkill):
                         "detour_km": 0,
                         "pois": [],
                     })
+                else:
+                    fuel_gaps.append(fp["km_from_origin"])
 
         # 7. Paradas de descanso com POIs e nome legível via reverse geocoding
         rest_stops: list[dict[str, Any]] = []
@@ -226,7 +253,7 @@ class RoutePlannerSkill(BaseSkill):
 
         # 8. Formatar texto
         display = _format_whatsapp(
-            origin_str, destination_str, total_km, total_minutes, all_stops, omitted_pois
+            origin_str, destination_str, total_km, total_minutes, all_stops, omitted_pois, fuel_gaps
         )
 
         result = SkillResult(
@@ -239,28 +266,36 @@ class RoutePlannerSkill(BaseSkill):
                 "total_km": total_km,
                 "estimated_hours": round(total_minutes / 60, 1),
                 "fuel_stops_count": len(fuel_stops),
+                "fuel_gaps_km": fuel_gaps,
                 "fixed_pois_omitted": omitted_pois,
             },
             user_visible_text=display,
         )
-        _save_last_route(ctx.sender, {"stops": all_stops, "origin": origin_str, "destination": destination_str})
+        _save_last_route(ctx.sender, {"stops": all_stops, "origin": origin_str, "destination": destination_str, "coordinates": coordinates})
         return result
 
 
 # ── GPX ──────────────────────────────────────────────────────────────────────
 
-def _build_gpx(origin: str, destination: str, stops: list[dict]) -> bytes:
+def _build_gpx(origin: str, destination: str, stops: list[dict], coordinates: list = None) -> bytes:
     gpx = Element("gpx", {"version": "1.1", "creator": "travis-agent", "xmlns": "http://www.topografix.com/GPX/1/1"})
     meta = SubElement(gpx, "metadata")
     SubElement(meta, "name").text = f"{origin} → {destination}"
     SubElement(meta, "time").text = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if coordinates:
+        trk = SubElement(gpx, "trk")
+        SubElement(trk, "name").text = f"{origin} → {destination}"
+        trkseg = SubElement(trk, "trkseg")
+        for lat, lon in coordinates:
+            SubElement(trkseg, "trkpt", {"lat": str(lat), "lon": str(lon)})
 
     for stop in stops:
         wpt = SubElement(gpx, "wpt", {"lat": str(stop["lat"]), "lon": str(stop["lon"])})
         label = _STOP_LABELS.get(stop["type"], "Parada")
         SubElement(wpt, "name").text = stop["name"]
         SubElement(wpt, "desc").text = f"{label} — km {stop['km_from_origin']:.0f}"
-        SubElement(wpt, "sym").text = "Waypoint"
+        SubElement(wpt, "sym").text = _GPX_SYMS.get(stop["type"], "Waypoint")
 
     return b'<?xml version="1.0" encoding="UTF-8"?>\n' + tostring(gpx, encoding="unicode").encode("utf-8")
 
@@ -334,6 +369,13 @@ def _eta(km_from_origin: float, total_km: float, total_minutes: int) -> int:
     return round(km_from_origin / total_km * total_minutes)
 
 
+_GPX_SYMS = {
+    "waypoint_fixed": "Flag, Blue",
+    "poi_fixed": "Star",
+    "rest": "Scenic Area",
+    "fuel": "Gas Station",
+}
+
 _STOP_ICONS = {
     "waypoint_fixed": "📌",
     "poi_fixed": "⭐",
@@ -396,6 +438,7 @@ def _format_whatsapp(
     total_minutes: int,
     stops: list[dict],
     omitted_pois: list[str],
+    fuel_gaps: list[float] | None = None,
 ) -> str:
     lines = [
         f"🗺️ *Rota: {origin} → {destination}*",
@@ -422,6 +465,11 @@ def _format_whatsapp(
     if omitted_pois:
         lines.append("")
         lines.append(f"⚠️ Não incluí: {', '.join(omitted_pois)} (desvio excede o limite configurado).")
+
+    if fuel_gaps:
+        lines.append("")
+        kms = ", ".join(f"km {g:.0f}" for g in fuel_gaps)
+        lines.append(f"⛽⚠️ Sem posto mapeado perto de: {kms}. Abasteça antes — trecho pode exceder a autonomia.")
 
     lines.append("")
     lines.append(f"🔗 {_maps_link(origin, destination, stops)}")

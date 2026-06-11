@@ -99,6 +99,7 @@ def _build_prompt(
             "Para create em n8n_schedule_alert, inclua args.run_at com o datetime ISO 8601 extraído do pedido (ex: 2026-03-12T19:28:00).",
             "Para delete, inclua args.idTask quando já houver id explícito no pedido.",
             "Use garmin_tracking quando o usuário pedir por garmin ou update/atualização/dados de treino/atividade/histórico/agenda do Garmin. Os únicos args válidos são start_date e end_date (formato YYYY-MM-DD), ambos opcionais. Não invente outros args.",
+            "Use route_planner quando o usuário pedir rota, trajeto ou itinerário. Extraia origin e destination obrigatoriamente. Se o usuário mencionar paradas intermediárias (ex: 'passando por X e Y'), inclua-as em fixed_waypoints como lista ordenada de strings na sequência da viagem. A viagem é sempre de moto: nunca pergunte sobre meio de transporte, veículo ou modo — planeje direto com origin e destination.",
             "Use summarize_url quando houver URL explícita.",
             "Use web_search quando depender de informação externa atual.",
             "Use direct_answer nos demais casos.",

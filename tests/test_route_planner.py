@@ -8,6 +8,9 @@ _SP = (-23.5505, -46.6333)
 _FLORIPA = (-27.5954, -48.5480)
 _CURITIBA = (-25.4284, -49.2733)
 _VILA_VELHA = (-25.2254, -50.0021)
+_CAMPINAS = (-22.9099, -47.0626)
+_RIBEIRAO = (-21.1704, -47.8103)
+_UBERLANDIA = (-18.9187, -48.2772)
 
 _ROUTE_SP_FLORIPA = {
     "total_km": 720.0,
@@ -161,6 +164,41 @@ class RoutePlannerStopsTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.output["fuel_stops_count"], 0)
 
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_FLORIPA)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _FLORIPA])
+    def test_fuel_gap_when_no_station_found(self, mock_geo, mock_route, mock_pois):
+        # Nenhum posto em nenhum raio → trechos viram fuel_gaps com aviso de autonomia.
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Florianópolis, SC",
+            "fuel": {"enabled": True, "max_interval_km": 180, "tank_km_remaining": 200},
+        })
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output["fuel_stops_count"], 0)
+        self.assertTrue(result.output["fuel_gaps_km"])
+        self.assertIn("Sem posto mapeado", result.user_visible_text)
+
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_FLORIPA)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _FLORIPA])
+    def test_fuel_station_found_only_in_wider_radius(self, mock_geo, mock_route):
+        # Raio 5km vazio, 10km acha: parada deve ser criada, sem gap.
+        def _pois(lat, lon, radius, categories):
+            if "posto" in (categories[0] if categories else "") and radius >= 10000:
+                return [{"name": "Posto Estrada", "type": "fuel", "lat": lat, "lon": lon}]
+            return []
+        skill = _make_skill()
+        with patch("utils.geo_client.get_pois", side_effect=_pois):
+            result = skill.run(_CTX, {
+                "origin": "São Paulo, SP",
+                "destination": "Florianópolis, SC",
+                "fuel": {"enabled": True, "max_interval_km": 180, "tank_km_remaining": 200},
+            })
+        self.assertTrue(result.ok)
+        self.assertGreater(result.output["fuel_stops_count"], 0)
+        self.assertEqual(result.output["fuel_gaps_km"], [])
+
 
 class RoutePlannerIntervalTests(unittest.TestCase):
 
@@ -202,6 +240,112 @@ class RoutePlannerIntervalTests(unittest.TestCase):
         self.assertTrue(result.ok)
         rest = [s for s in result.output["stops"] if s["type"] == "rest"]
         self.assertLessEqual(len(rest), 2)
+
+
+class RoutePlannerMultiWaypointTests(unittest.TestCase):
+
+    _ROUTE_SP_UDI = {
+        "total_km": 600.0,
+        "total_minutes": 420,
+        "coordinates": [
+            _SP,
+            _CAMPINAS,
+            (-22.0, -47.5),
+            _RIBEIRAO,
+            (-20.0, -48.0),
+            _UBERLANDIA,
+        ],
+    }
+
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_UDI)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _UBERLANDIA, _CAMPINAS, _RIBEIRAO])
+    def test_multiple_waypoints_all_appear_in_stops(self, mock_geo, mock_route, mock_pois):
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Uberlândia, MG",
+            "fixed_waypoints": ["Campinas, SP", "Ribeirão Preto, SP"],
+        })
+        self.assertTrue(result.ok)
+        fixed = [s for s in result.output["stops"] if s["type"] == "waypoint_fixed"]
+        self.assertEqual(len(fixed), 2)
+        names = [s["name"] for s in fixed]
+        self.assertIn("Campinas, SP", names)
+        self.assertIn("Ribeirão Preto, SP", names)
+
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_UDI)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _UBERLANDIA, _CAMPINAS, _RIBEIRAO])
+    def test_multiple_waypoints_ordered_by_km(self, mock_geo, mock_route, mock_pois):
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Uberlândia, MG",
+            "fixed_waypoints": ["Campinas, SP", "Ribeirão Preto, SP"],
+        })
+        self.assertTrue(result.ok)
+        kms = [s["km_from_origin"] for s in result.output["stops"]]
+        self.assertEqual(kms, sorted(kms))
+
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_UDI)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _UBERLANDIA, _CAMPINAS, _RIBEIRAO])
+    def test_waypoints_coexist_with_fuel_and_rest(self, mock_geo, mock_route, mock_pois):
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Uberlândia, MG",
+            "fixed_waypoints": ["Campinas, SP", "Ribeirão Preto, SP"],
+            "fuel": {"enabled": False},
+        })
+        self.assertTrue(result.ok)
+        types = {s["type"] for s in result.output["stops"]}
+        self.assertIn("waypoint_fixed", types)
+
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_UDI)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _UBERLANDIA, _CAMPINAS])
+    def test_waypoints_as_string_normalized_to_list(self, mock_geo, mock_route, mock_pois):
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Uberlândia, MG",
+            "fixed_waypoints": "Campinas, SP",
+        })
+        self.assertTrue(result.ok)
+        fixed = [s for s in result.output["stops"] if s["type"] == "waypoint_fixed"]
+        self.assertEqual(len(fixed), 1)
+        self.assertEqual(fixed[0]["name"], "Campinas, SP")
+
+    @patch("utils.geo_client.get_pois", return_value=[])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_UDI)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _UBERLANDIA, ValueError("não encontrado")])
+    def test_unresolvable_waypoint_fails_route(self, mock_geo, mock_route, mock_pois):
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Uberlândia, MG",
+            "fixed_waypoints": ["Cidade Inexistente XYZ"],
+        })
+        self.assertFalse(result.ok)
+        self.assertIn("Cidade Inexistente XYZ", result.user_visible_text)
+
+
+class RoutePlannerModeTests(unittest.TestCase):
+
+    @patch("utils.geo_client.get_pois", return_value=[{"name": "Posto BR", "type": "fuel", "lat": -25.0, "lon": -49.0}])
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_FLORIPA)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _FLORIPA])
+    def test_default_mode_motorcycle_applies_fuel_default(self, mock_geo, mock_route, mock_pois):
+        # Sem fuel nos args, o default de moto (180km/200km) deve gerar abastecimento.
+        skill = _make_skill()
+        result = skill.run(_CTX, {
+            "origin": "São Paulo, SP",
+            "destination": "Florianópolis, SC",
+        })
+        self.assertTrue(result.ok)
+        self.assertGreater(result.output["fuel_stops_count"], 0)
 
 
 class RoutePlannerPOITests(unittest.TestCase):

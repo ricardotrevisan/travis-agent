@@ -182,14 +182,19 @@ class RoutePlannerStopsTests(unittest.TestCase):
 
     @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_FLORIPA)
     @patch("utils.geo_client.geocode", side_effect=[_SP, _FLORIPA])
-    def test_fuel_station_found_only_in_wider_radius(self, mock_geo, mock_route):
-        # Raio 5km vazio, 10km acha: parada deve ser criada, sem gap.
+    def test_fuel_station_found_at_offset_along_route(self, mock_geo, mock_route):
+        # Posto não existe no km exato do alvo, só num ponto deslocado à frente
+        # na rota. A varredura por offsets (+5/-5/+10...) deve achá-lo, criar a
+        # parada sem desvio e sem gerar gap. Cada candidato consultado cai na
+        # própria polyline, então o raio de busca é sempre o fixo (5km).
         def _pois(lat, lon, radius, categories):
-            if "posto" in (categories[0] if categories else "") and radius >= 10000:
+            # só responde para latitudes mais ao sul que o primeiro segmento,
+            # garantindo que o hit veio de um ponto avançado na rota, não do km 0.
+            if lat <= -24.5:
                 return [{"name": "Posto Estrada", "type": "fuel", "lat": lat, "lon": lon}]
             return []
         skill = _make_skill()
-        with patch("utils.geo_client.get_pois", side_effect=_pois):
+        with patch("utils.geo_client.get_pois", side_effect=_pois) as mock_pois:
             result = skill.run(_CTX, {
                 "origin": "São Paulo, SP",
                 "destination": "Florianópolis, SC",
@@ -198,6 +203,41 @@ class RoutePlannerStopsTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertGreater(result.output["fuel_stops_count"], 0)
         self.assertEqual(result.output["fuel_gaps_km"], [])
+        # raio fixo: a varredura é por deslocamento na rota, não por raio crescente.
+        for call in mock_pois.call_args_list:
+            self.assertEqual(call.args[2], 5000)
+
+    @patch("utils.geo_client.get_route", return_value=_ROUTE_SP_FLORIPA)
+    @patch("utils.geo_client.geocode", side_effect=[_SP, _FLORIPA])
+    def test_consecutive_fuel_gap_never_exceeds_autonomy(self, mock_geo, mock_route):
+        # Cada alvo é reancorado no posto anterior de fato escolhido. Mesmo que a
+        # varredura por offset empurre um posto para frente e outro para trás, o
+        # intervalo entre postos consecutivos não pode estourar a autonomia.
+        # Aqui forçamos hits sempre no offset +15 (à frente) para maximizar a
+        # tendência de "esticar" o gap — que a reancoragem deve conter.
+        first = {"n": 0}
+        def _pois(lat, lon, radius, categories):
+            # devolve posto só esporadicamente, simulando estrada com postos
+            # esparsos onde o range tem de trabalhar.
+            first["n"] += 1
+            if first["n"] % 7 == 0:
+                return [{"name": "Posto X", "type": "fuel", "lat": lat, "lon": lon}]
+            return []
+        autonomy = 180.0  # min(180, 200*0.85)=170 na prática; usamos o teto real
+        with patch("utils.geo_client.get_pois", side_effect=_pois):
+            result = _make_skill().run(_CTX, {
+                "origin": "São Paulo, SP",
+                "destination": "Florianópolis, SC",
+                "fuel": {"enabled": True, "max_interval_km": 180, "tank_km_remaining": 200},
+            })
+        self.assertTrue(result.ok)
+        fuel = [s for s in result.output["stops"] if s["type"] == "fuel"]
+        kms = sorted(s["km_from_origin"] for s in fuel)
+        prev = 0.0
+        for km in kms:
+            # tolerância: 170 de autonomia + 15 de offset máximo à frente
+            self.assertLessEqual(km - prev, 170.0 + 15.0 + 0.5)
+            prev = km
 
 
 class RoutePlannerIntervalTests(unittest.TestCase):

@@ -13,6 +13,12 @@ import json
 import os
 import redis as _redis_lib
 
+# Range de busca de posto ao longo da rota: km do alvo primeiro, depois à
+# frente e atrás em patamares crescentes (+5/-5, +10/-10, +15/-15). Privilegia
+# quem está logo adiante antes de quem ficou para trás.
+_FUEL_RANGE_OFFSETS_KM = (0, 5, -5, 10, -10, 15, -15)
+_FUEL_SEARCH_RADIUS_M = 5000
+
 def _get_redis():
     return _redis_lib.Redis(
         host=os.getenv("REDIS_HOST", "redis"),
@@ -204,15 +210,34 @@ class RoutePlannerSkill(BaseSkill):
             tank_remaining = float(fuel_args.get("tank_km_remaining") or fuel_interval)
             fuel_brands = fuel_args.get("preferred_brands") or []
             fuel_categories = ["posto de gasolina"] + [b.lower() for b in fuel_brands]
-            fuel_points = geo_client.sample_waypoints(coordinates, total_km, min(fuel_interval, tank_remaining * 0.85), total_minutes)
-            for fp in fuel_points:
-                # Raio progressivo: não achar posto num ponto exigido pela autonomia
-                # é risco real numa moto, então ampliamos a busca antes de desistir.
+            # Intervalo entre abastecimentos limitado pela autonomia disponível.
+            fuel_interval_km = min(fuel_interval, tank_remaining * 0.85)
+            # O alvo do próximo posto é medido a PARTIR DO POSTO ANTERIOR de fato
+            # escolhido (não de múltiplos fixos da origem). Sem isso, a varredura
+            # por offset deslocaria cada posto de forma independente e o gap entre
+            # postos consecutivos poderia exceder a autonomia. Reancorando em
+            # last_refuel_km, o intervalo real nunca passa de fuel_interval_km.
+            last_refuel_km = 0.0
+            while last_refuel_km + fuel_interval_km < total_km:
+                target_km = last_refuel_km + fuel_interval_km
+                # Range sobre a própria rota: varremos pontos da polyline à frente
+                # e atrás do alvo (+5/-5, +10/-10, +15/-15) buscando posto num raio
+                # fixo. Todo candidato cai na rota, então não há desvio.
+                # Se o próprio alvo já cai além da polyline, é fim de rota — não
+                # gap. (total_km vem do OSRM em distância de rodovia e pode ser
+                # maior que o comprimento haversine da polyline.)
+                if geo_client.point_at_km(coordinates, target_km, total_minutes, total_km) is None:
+                    break
                 best = None
-                for radius in (5000, 10000, 15000):
-                    nearby = geo_client.get_pois(fp["lat"], fp["lon"], radius, fuel_categories)
+                best_point = None
+                for offset in _FUEL_RANGE_OFFSETS_KM:
+                    cand = geo_client.point_at_km(coordinates, target_km + offset, total_minutes, total_km)
+                    if not cand:
+                        continue
+                    nearby = geo_client.get_pois(cand["lat"], cand["lon"], _FUEL_SEARCH_RADIUS_M, fuel_categories)
                     if nearby:
                         best = nearby[0]
+                        best_point = cand
                         break
                 if best:
                     fuel_stops.append({
@@ -220,13 +245,20 @@ class RoutePlannerSkill(BaseSkill):
                         "name": best["name"],
                         "lat": best["lat"],
                         "lon": best["lon"],
-                        "km_from_origin": fp["km_from_origin"],
-                        "eta_minutes": fp["eta_minutes"],
+                        "km_from_origin": best_point["km_from_origin"],
+                        "eta_minutes": best_point["eta_minutes"],
                         "detour_km": 0,
                         "pois": [],
                     })
+                    # reancora no posto real: o próximo alvo parte daqui. Nunca
+                    # recua (um posto achado atrás do alvo não pode estagnar o
+                    # laço), então garantimos progresso mínimo até o alvo teórico.
+                    last_refuel_km = max(best_point["km_from_origin"], target_km)
                 else:
-                    fuel_gaps.append(fp["km_from_origin"])
+                    # Nenhum posto no range: registra gap e avança o alvo teórico
+                    # para não travar o laço (e a próxima janela ainda é tentada).
+                    fuel_gaps.append(target_km)
+                    last_refuel_km = target_km
 
         # 7. Paradas de descanso com POIs e nome legível via reverse geocoding
         rest_stops: list[dict[str, Any]] = []

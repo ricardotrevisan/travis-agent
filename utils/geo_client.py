@@ -109,6 +109,34 @@ def sample_waypoints(
     return result
 
 
+def point_at_km(
+    coordinates: list[tuple[float, float]],
+    target_km: float,
+    total_minutes: int = 0,
+    total_km: float = 0.0,
+) -> dict[str, Any] | None:
+    """Ponto da polyline na distância acumulada `target_km` (sobre a rota).
+
+    Diferente de buscar num raio em torno de um único ponto, aqui andamos ao
+    longo do trajeto: o candidato sempre cai na própria rota, então não há
+    desvio. Retorna None se target_km cair fora de [0, comprimento da rota].
+    """
+    if not coordinates or target_km < 0:
+        return None
+    accumulated = 0.0
+    for i in range(1, len(coordinates)):
+        seg = _haversine_km(coordinates[i - 1], coordinates[i])
+        if accumulated + seg >= target_km:
+            # interpola dentro do segmento para aproximar o km exato
+            frac = (target_km - accumulated) / seg if seg > 0 else 0.0
+            lat = coordinates[i - 1][0] + (coordinates[i][0] - coordinates[i - 1][0]) * frac
+            lon = coordinates[i - 1][1] + (coordinates[i][1] - coordinates[i - 1][1]) * frac
+            eta = round(target_km / total_km * total_minutes) if total_km > 0 and total_minutes > 0 else 0
+            return {"lat": lat, "lon": lon, "km_from_origin": round(target_km, 1), "eta_minutes": eta}
+        accumulated += seg
+    return None
+
+
 def reverse_geocode(lat: float, lon: float) -> str:
     try:
         resp = requests.get(

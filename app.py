@@ -3,6 +3,7 @@ import os
 import json
 import base64
 import re
+import threading
 import requests
 from dotenv import load_dotenv
 import redis
@@ -29,6 +30,8 @@ if resolved_allowlist and not os.getenv("ALLOWED_WHATSAPP_NUMBERS"):
     os.environ["ALLOWED_WHATSAPP_NUMBERS"] = resolved_allowlist
 
 from runtime.orchestrator import handle_webhook_v2
+from runtime.models import RequestContext
+from skills.product_monitor import ProductMonitorSkill
 
 EVOLUTION_URL = os.getenv("EVOLUTION_URL")
 EVOLUTION_APIKEY = _resolve_env("EVOLUTION_APIKEY", "WA_AGENT_EVOLUTION_APIKEY")
@@ -41,6 +44,10 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 REDIS_PREFIX = os.getenv("REDIS_PREFIX", "agent")
 WEBHOOK_DEDUPE_TTL_SECONDS = int(os.getenv("WEBHOOK_DEDUPE_TTL_SECONDS", "300"))
+# Default do contrato n8n "tasks"; destino do alerta do monitor de produto.
+MONITOR_ALERT_SENDER = (os.getenv("MONITOR_ALERT_SENDER") or "5511975196655@s.whatsapp.net").strip()
+
+_product_monitor_skill = ProductMonitorSkill()
 
 app = Flask(__name__)
 
@@ -272,6 +279,46 @@ def task_callback():
             "instance": instance_name,
         }
     )
+
+
+def _run_product_monitor(sender: str, instance_name: str) -> None:
+    """Executa a varredura e, se achar, alerta no WhatsApp. Roda em background."""
+    try:
+        ctx = RequestContext(
+            sender=sender,
+            instance_name=instance_name,
+            message_id="product_monitor",
+            user_text="",
+        )
+        result = _product_monitor_skill.run(ctx, {})
+        hit_count = (result.output or {}).get("hit_count", 0)
+        print(f"[monitor/product] done ok={result.ok} hits={hit_count}")
+        # Sempre reporta a rodada por WhatsApp (encontrou ou não).
+        if result.ok and result.user_visible_text:
+            number = _normalize_whatsapp_number(sender)
+            send_whatsapp_message(number, result.user_visible_text, instance_name)
+    except Exception as exc:
+        print(f"[monitor/product] background error: {exc}")
+
+
+@app.get("/monitor/product")
+def monitor_product():
+    secret = (request.args.get("secret") or request.headers.get("X-Task-Secret") or "").strip()
+    if TASK_CALLBACK_SECRET and secret != TASK_CALLBACK_SECRET:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    sender = _normalize_whatsapp_number(request.args.get("sender") or MONITOR_ALERT_SENDER)
+    if not sender:
+        return jsonify({"ok": False, "error": "sender inválido"}), 400
+    instance_name = (request.args.get("instance") or INSTANCE).strip() or INSTANCE
+
+    threading.Thread(
+        target=_run_product_monitor,
+        args=(sender, instance_name),
+        daemon=True,
+    ).start()
+    print(f"[monitor/product] started sender={sender} instance={instance_name}")
+    return jsonify({"ok": True, "status": "started"}), 202
 
 
 # ---------------------------------------------------------------------

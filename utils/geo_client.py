@@ -12,6 +12,12 @@ _GOOGLE_MAPS_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 _TIMEOUT = 10
 _geocode_cache: dict[str, tuple[float, float]] = {}
 
+# Apenas postos de bandeira conhecida são aceitos como ponto de abastecimento.
+# Qualquer resultado do Google Places que não contenha um desses termos é descartado.
+_FUEL_NAME_ALLOWLIST = (
+    "ipiranga", "petrobras", "shell", "br mania", "am pm",
+)
+
 _CATEGORY_PLACES: dict[str, str] = {
     "restaurante": "restaurant",
     "lanchonete": "meal_takeaway",
@@ -178,10 +184,40 @@ def get_pois(
                     continue
                 seen.add(name)
                 loc = r.get("geometry", {}).get("location", {})
-                pois.append({"name": name, "type": place_type, "lat": loc.get("lat"), "lon": loc.get("lng")})
+                has_brand = any(term in name.lower() for term in _FUEL_NAME_ALLOWLIST)
+                pois.append({"name": name, "type": place_type, "lat": loc.get("lat"), "lon": loc.get("lng"), "has_brand": has_brand, "place_id": r.get("place_id", "")})
         except Exception:
             continue
     return pois
+
+
+_GOOGLE_PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+_FUEL_WEBSITE_ALLOWLIST = ("petrobras", "ipiranga", "shell",)
+
+def get_place_details(place_id: str) -> str:
+    """Retorna string concatenada de todos os campos úteis para identificar bandeira de posto."""
+    try:
+        resp = requests.get(
+            _GOOGLE_PLACE_DETAILS_URL,
+            params={
+                "place_id": place_id,
+                "fields": "name,website,editorial_summary,reviews",
+                "key": _GOOGLE_MAPS_KEY,
+                "language": "pt-BR",
+            },
+            timeout=5,
+        )
+        result = resp.json().get("result", {})
+        parts = [
+            result.get("name", ""),
+            result.get("website", ""),
+            result.get("editorial_summary", {}).get("overview", ""),
+        ]
+        for review in (result.get("reviews") or [])[:3]:
+            parts.append(review.get("text", ""))
+        return " ".join(parts).lower()
+    except Exception:
+        return ""
 
 
 def detour_km(
@@ -191,3 +227,23 @@ def detour_km(
     if not route_coords:
         return 999.0
     return min(_haversine_km(c, point) for c in route_coords)
+
+
+def driving_distance_m(
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+) -> float:
+    """Distância real de rodovia entre dois pontos via OSRM. Retorna 999999 em caso de erro."""
+    try:
+        coord_str = f"{origin[1]},{origin[0]};{destination[1]},{destination[0]}"
+        resp = requests.get(
+            f"{_OSRM_URL}/{coord_str}",
+            params={"overview": "false", "steps": "false"},
+            timeout=5,
+        )
+        data = resp.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            return data["routes"][0]["distance"]
+    except Exception:
+        pass
+    return 999999.0

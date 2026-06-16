@@ -90,6 +90,7 @@ Examples:
 web_search
 summarize_url
 n8n_schedule_alert
+product_monitor
 ```
 
 In V2, skills encapsulate behavior and can orchestrate tool usage.
@@ -186,6 +187,11 @@ flowchart TD
 
     N[n8n callback POST /webhook/task-callback] --> O[secret + allowlist + dedupe]
     O --> P[sendText to WhatsApp]
+
+    Q[n8n Schedule GET /monitor/product] --> R[secret check]
+    R --> T[background thread: product_monitor skill]
+    T --> U[ProductScraper: Serper + Jina over monitored sites]
+    U --> W[sendText report to WhatsApp every run]
 ```
 
 ---
@@ -323,6 +329,46 @@ The intent is not only to publish code, but to make explicit **the structure req
   - header: `X-Task-Secret` (when `TASK_CALLBACK_SECRET` is configured)
   - expected callback fields: `task_id|idTask`, sender, and message.
 - If `OPENAI_API_KEY` is unavailable, planner fallback defaults to `direct_answer` (it will not force-route to n8n).
+
+### Product Monitor (V2)
+
+Periodic stock monitor for a fixed product/size across motorcycle gear stores. Triggered by an external n8n Schedule; all results are reported to WhatsApp.
+
+- Internal skill `product_monitor` (not planner-visible; invoked via endpoint). It runs **multiple targets** (`MonitorTarget` in `utils/product_scraper.py`) in one call and concatenates the WhatsApp report.
+- **Target 1 — Calça AlpineStars Halo Preta**, size **5G** (= 4XL). Criterion `size`. Sites: Alpinestars BR (`alpinestarsbr.com.br`), Zelão (`zelao.com.br`), Sacramento (`sacramento.com.br`), Nácar, Spinelli Motos, Mercado Livre, Grid Motors, Superbike Shop, MotoX Wear, Web Riders. Note: MotoX Wear is motocross-focused and doesn't carry the Halo touring line — its "no candidate" is correct.
+- **Target 2 — Bolha/windscreen Triumph Scrambler 1200** (original part **A9708606**). Criterion `name`: confirmed by `scrambler` in title/URL, other models/accessories excluded. The part number A9708606 is **desirable but not required** (dealers rarely cite it) — it's flagged on the hit (`reference_seen`) when present. Sites: Power Moto, Osten/CWB/Rio Preto Triumph, **Triumph BH boutique** (`loja.triumphbh.com.br`), Triumph BR, Mercado Livre. In practice only Mercado Livre fires today: dealers expose only category pages (no product/stock) to Serper.
+- Getting each store's exact domain right matters: a wrong domain silently yields "no candidate" from Serper. **Keep Serper queries short** — with the `site:` operator, long queries return nothing on many domains.
+- Detection is heuristic: Serper (`<query> site:<domain>`) finds candidate pages; the **product is confirmed by the candidate's title/URL** (required terms present, excluded terms absent) — not by the page body, which is polluted by menus and "related products" (a glove of the same line appears on the pants page). Jina fetches page text to check the criterion (size token / reference) + in-stock signals, with out-of-stock signals taking priority.
+- **Playwright fallback:** size grids load via JavaScript on most stores and don't appear in Jina's static text. When the product is confirmed but the size isn't found, the page is re-rendered headless via Chromium (`utils/playwright_fetcher.py`) and re-checked. Disable with `use_playwright_fallback=False`. Requires the Playwright/Chromium image (already in the Dockerfile); runs only inside the container. Size equivalences follow the **official Alpinestars pants chart** (`utils/product_scraper.py`), not the generic "G" count: 3G = 2XL; 4G = 3XL; 5G = 4XL; 6G = 5XL. Euro numbering (58/60/62…) is intentionally **not** matched — a bare number on the page causes too many false positives (prices, delivery terms).
+
+Endpoint:
+
+- `GET /monitor/product`
+- Responds immediately with `202 {"ok":true,"status":"started"}`; the scan runs in a **background thread**.
+- Auth: when `TASK_CALLBACK_SECRET` is set, pass `?secret=<value>` or header `X-Task-Secret`.
+- Optional query params: `sender` (defaults to `MONITOR_ALERT_SENDER`), `instance`.
+
+WhatsApp reporting (every run, hit or not):
+
+- Hit: `🟢 Busca das HH:MM: encontrei *<produto>* tamanho <size> em estoque:` followed by `• <Loja>: <url>` per hit.
+- No hit: `🔍 Busca das HH:MM: procurei *<produto>* tamanho <size> em N sites (...). Nada em estoque desta vez.`
+
+n8n wiring:
+
+- Node **Schedule** (e.g. 60 min) → node **HTTP Request** `GET http://travis:5000/monitor/product?secret=<TASK_CALLBACK_SECRET>`.
+- **Networking:** `travis` (network `evolution-net`) and the n8n container run on different Docker networks, so n8n cannot resolve the `travis` hostname by default (`getaddrinfo EAI_AGAIN travis`); `host.docker.internal` does not resolve inside n8n here either. Fix: attach n8n to `evolution-net` (additive, does not disturb its existing network):
+  ```bash
+  docker network connect evolution-net <n8n_container>
+  ```
+  To persist across container recreation, add to the n8n stack compose: service `networks: [default, evolution-net]` and a top-level `networks: { evolution-net: { external: true } }`.
+
+Relevant env vars:
+
+- `TASK_CALLBACK_SECRET` (shared with `/webhook/task-callback`)
+- `MONITOR_ALERT_SENDER` (defaults to `5511975196655@s.whatsapp.net`)
+- `PLAYWRIGHT_TIMEOUT` (seconds, default 30) — per-page render timeout for the fallback
+
+Note: the Playwright fallback renders each unresolved page in a headless browser, so a full scan takes longer than a pure Jina pass. This is fine — the endpoint returns `started` immediately and the work runs in the background thread.
 
 ### Garmin Token Bootstrap (local repo)
 

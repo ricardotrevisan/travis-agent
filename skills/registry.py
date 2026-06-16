@@ -9,6 +9,7 @@ from skills.voice_note_reply import VoiceNoteReplySkill
 from skills.web_search import WebSearchSkill
 from skills.mcp_tools import load_mcp_skills
 from skills.route_planner import RoutePlannerSkill
+from skills.product_monitor import ProductMonitorSkill
 
 
 class SkillRegistry:
@@ -22,6 +23,7 @@ class SkillRegistry:
             "web_search": WebSearchSkill(),
             "summarize_url": SummarizeURLSkill(),
             "voice_note_reply": VoiceNoteReplySkill(),
+            "product_monitor": ProductMonitorSkill(),
         }
         try:
             self._skills["route_planner"] = RoutePlannerSkill()

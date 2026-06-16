@@ -13,11 +13,11 @@ import json
 import os
 import redis as _redis_lib
 
-# Range de busca de posto ao longo da rota: km do alvo primeiro, depois à
-# frente e atrás em patamares crescentes (+5/-5, +10/-10, +15/-15). Privilegia
-# quem está logo adiante antes de quem ficou para trás.
-_FUEL_RANGE_OFFSETS_KM = (0, 5, -5, 10, -10, 15, -15)
-_FUEL_SEARCH_RADIUS_M = 5000
+# Raio de busca do Google Places a partir de cada ponto amostrado da rota.
+_FUEL_SEARCH_RADIUS_M = 2000
+# Detour máximo aceito via OSRM (metros de rodovia do ponto da rota até o posto).
+# Cobre acessos reais de rodovia sem aceitar retornos longos.
+_FUEL_MAX_DETOUR_M = 3000
 
 def _get_redis():
     return _redis_lib.Redis(
@@ -204,41 +204,52 @@ class RoutePlannerSkill(BaseSkill):
 
         # 6. Paradas de abastecimento
         fuel_stops: list[dict[str, Any]] = []
-        fuel_gaps: list[float] = []  # km onde a autonomia exige posto mas nenhum foi mapeado
+        fuel_gaps: list[float] = []
         if fuel_args.get("enabled"):
             fuel_interval = float(fuel_args.get("max_interval_km") or 200)
             tank_remaining = float(fuel_args.get("tank_km_remaining") or fuel_interval)
             fuel_brands = fuel_args.get("preferred_brands") or []
             fuel_categories = ["posto de gasolina"] + [b.lower() for b in fuel_brands]
-            # Intervalo entre abastecimentos limitado pela autonomia disponível.
-            fuel_interval_km = min(fuel_interval, tank_remaining * 0.85)
-            # O alvo do próximo posto é medido a PARTIR DO POSTO ANTERIOR de fato
-            # escolhido (não de múltiplos fixos da origem). Sem isso, a varredura
-            # por offset deslocaria cada posto de forma independente e o gap entre
-            # postos consecutivos poderia exceder a autonomia. Reancorando em
-            # last_refuel_km, o intervalo real nunca passa de fuel_interval_km.
+            fuel_limit_km = min(fuel_interval, tank_remaining * 0.85)
+
             last_refuel_km = 0.0
-            while last_refuel_km + fuel_interval_km < total_km:
-                target_km = last_refuel_km + fuel_interval_km
-                # Range sobre a própria rota: varremos pontos da polyline à frente
-                # e atrás do alvo (+5/-5, +10/-10, +15/-15) buscando posto num raio
-                # fixo. Todo candidato cai na rota, então não há desvio.
-                # Se o próprio alvo já cai além da polyline, é fim de rota — não
-                # gap. (total_km vem do OSRM em distância de rodovia e pode ser
-                # maior que o comprimento haversine da polyline.)
-                if geo_client.point_at_km(coordinates, target_km, total_minutes, total_km) is None:
+            while last_refuel_km + fuel_limit_km < total_km:
+                limit_km = last_refuel_km + fuel_limit_km
+                if geo_client.point_at_km(coordinates, limit_km, total_minutes, total_km) is None:
                     break
-                best = None
-                best_point = None
-                for offset in _FUEL_RANGE_OFFSETS_KM:
-                    cand = geo_client.point_at_km(coordinates, target_km + offset, total_minutes, total_km)
-                    if not cand:
-                        continue
-                    nearby = geo_client.get_pois(cand["lat"], cand["lon"], _FUEL_SEARCH_RADIUS_M, fuel_categories)
-                    if nearby:
-                        best = nearby[0]
-                        best_point = cand
-                        break
+
+                # Varrer do limite para trás a cada 5km, coletando candidatos por
+                # ponto. Em cada ponto, ordena por menor detour OSRM e aceita o
+                # melhor dentro do teto. Para no primeiro ponto onde achar posto
+                # válido — assim abastece o mais tarde possível com menor desvio.
+                best_detour, best, best_point = None, None, None
+                scan_km = limit_km
+                while scan_km > last_refuel_km + 10:
+                    cand = geo_client.point_at_km(coordinates, scan_km, total_minutes, total_km)
+                    if cand:
+                        pois = geo_client.get_pois(cand["lat"], cand["lon"], _FUEL_SEARCH_RADIUS_M, fuel_categories)
+                        scored = sorted(
+                            [(geo_client.driving_distance_m((cand["lat"], cand["lon"]), (p["lat"], p["lon"])), p) for p in pois],
+                            key=lambda x: x[0],
+                        )
+                        valid = [(det, p) for det, p in scored if det <= _FUEL_MAX_DETOUR_M]
+                        # camada 1: posto com bandeira conhecida no nome
+                        branded = [(det, p) for det, p in valid if p.get("has_brand")]
+                        if branded:
+                            best_detour, best = branded[0]
+                            best_point = cand
+                            break
+                        # camada 2: posto sem bandeira no nome — valida details completo
+                        for det, p in valid:
+                            details = geo_client.get_place_details(p.get("place_id", ""))
+                            if any(term in details for term in geo_client._FUEL_WEBSITE_ALLOWLIST):
+                                best_detour, best = det, p
+                                best_point = cand
+                                break
+                        if best:
+                            break
+                    scan_km -= 5
+
                 if best:
                     fuel_stops.append({
                         "type": "fuel",
@@ -247,18 +258,13 @@ class RoutePlannerSkill(BaseSkill):
                         "lon": best["lon"],
                         "km_from_origin": best_point["km_from_origin"],
                         "eta_minutes": best_point["eta_minutes"],
-                        "detour_km": 0,
+                        "detour_km": round(best_detour / 1000, 1),
                         "pois": [],
                     })
-                    # reancora no posto real: o próximo alvo parte daqui. Nunca
-                    # recua (um posto achado atrás do alvo não pode estagnar o
-                    # laço), então garantimos progresso mínimo até o alvo teórico.
-                    last_refuel_km = max(best_point["km_from_origin"], target_km)
+                    last_refuel_km = best_point["km_from_origin"]
                 else:
-                    # Nenhum posto no range: registra gap e avança o alvo teórico
-                    # para não travar o laço (e a próxima janela ainda é tentada).
-                    fuel_gaps.append(target_km)
-                    last_refuel_km = target_km
+                    fuel_gaps.append(limit_km)
+                    last_refuel_km = limit_km
 
         # 7. Paradas de descanso com POIs e nome legível via reverse geocoding
         rest_stops: list[dict[str, Any]] = []
@@ -284,8 +290,9 @@ class RoutePlannerSkill(BaseSkill):
         all_stops = sorted(stops + fuel_stops + rest_stops, key=lambda s: s["km_from_origin"])
 
         # 8. Formatar texto
+        last_fuel_km = max((s["km_from_origin"] for s in fuel_stops), default=None)
         display = _format_whatsapp(
-            origin_str, destination_str, total_km, total_minutes, all_stops, omitted_pois, fuel_gaps
+            origin_str, destination_str, total_km, total_minutes, all_stops, omitted_pois, fuel_gaps, last_fuel_km
         )
 
         result = SkillResult(
@@ -471,6 +478,7 @@ def _format_whatsapp(
     stops: list[dict],
     omitted_pois: list[str],
     fuel_gaps: list[float] | None = None,
+    last_fuel_km: float | None = None,
 ) -> str:
     lines = [
         f"🗺️ *Rota: {origin} → {destination}*",
@@ -502,6 +510,12 @@ def _format_whatsapp(
         lines.append("")
         kms = ", ".join(f"km {g:.0f}" for g in fuel_gaps)
         lines.append(f"⛽⚠️ Sem posto mapeado perto de: {kms}. Abasteça antes — trecho pode exceder a autonomia.")
+
+    if last_fuel_km is not None:
+        trecho_final = total_km - last_fuel_km
+        if trecho_final > 0:
+            lines.append("")
+            lines.append(f"ℹ️ Trecho final: ~{trecho_final:.0f} km sem posto previsto a partir do km {last_fuel_km:.0f}.")
 
     lines.append("")
     lines.append(f"🔗 {_maps_link(origin, destination, stops)}")

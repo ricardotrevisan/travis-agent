@@ -37,6 +37,7 @@ _CATEGORY_PLACES: dict[str, str] = {
     "gastronomia regional": "restaurant",
     "cultura": "museum",
     "adrenalina": "amusement_park",
+    "cafeteria premium": "cafe",
 }
 
 

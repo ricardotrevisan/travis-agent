@@ -52,12 +52,13 @@ def _poi_search_radius_m(avg_speed_kmh: float) -> int:
 
 # Critérios de qualidade por categoria
 _POI_QUALITY: dict[str, dict] = {
-    "natural_feature": {"min_rating": 4.4, "min_reviews": 50},
-    "restaurant":      {"min_rating": 4.4, "min_reviews": 50},
-    "cafe":            {"min_rating": 4.4, "min_reviews": 50},
-    "museum":          {"min_rating": 4.0, "min_reviews": 20},
-    "amusement_park":  {"min_rating": 4.4, "min_reviews": 50},
-    "park":            {"min_rating": 4.4, "min_reviews": 50},
+    "natural_feature":   {"min_rating": 4.4, "min_reviews": 50},
+    "restaurant":        {"min_rating": 4.4, "min_reviews": 50},
+    "cafe":              {"min_rating": 4.4, "min_reviews": 50},
+    "cafe_premium":      {"min_rating": 4.6, "min_reviews": 100},
+    "museum":            {"min_rating": 4.0, "min_reviews": 20},
+    "amusement_park":    {"min_rating": 4.4, "min_reviews": 50},
+    "park":              {"min_rating": 4.4, "min_reviews": 50},
 }
 
 # Desvio máximo por tipo de parada (km)
@@ -65,6 +66,7 @@ _POI_DETOUR_LIMITS: dict[str, float] = {
     "natural_feature": 12.0,
     "restaurant":       6.0,
     "cafe":             6.0,
+    "cafe_premium":     4.0,
     "museum":           6.0,
     "amusement_park":  12.0,
     "park":            12.0,
@@ -87,6 +89,10 @@ def _search_pois_along_route(
     seen_place_ids: set[str] = set()
     candidates: list[dict] = []
 
+    # "cafeteria premium" é buscada separadamente com critérios próprios
+    premium_cafe = "cafeteria premium" in [c.lower().strip() for c in categories]
+    regular_categories = [c for c in categories if c.lower().strip() != "cafeteria premium"]
+
     km = sample_interval_km
     while km < total_km:
         point = geo_client.point_at_km(coordinates, km, total_minutes, total_km)
@@ -94,45 +100,52 @@ def _search_pois_along_route(
             km += sample_interval_km
             continue
 
-        # velocidade média do segmento como proxy de contexto
         elapsed_minutes = point["eta_minutes"] or 1
         avg_speed = (km / elapsed_minutes * 60) if elapsed_minutes > 0 else 80.0
         radius_m = _poi_search_radius_m(avg_speed)
 
-        pois = geo_client.get_pois(point["lat"], point["lon"], radius_m, categories)
-        for poi in pois:
-            pid = poi.get("place_id", "")
-            if not pid or pid in seen_place_ids:
-                continue
-            place_type = poi.get("type", "")
-            if place_type in _POI_BLOCKED_TYPES:
-                continue
+        # lotes de busca: categorias regulares + cafeteria premium separada
+        batches: list[tuple[list[str], str | None]] = []
+        if regular_categories:
+            batches.append((regular_categories, None))
+        if premium_cafe:
+            batches.append((["cafeteria premium"], "cafe_premium"))
 
-            rating = poi.get("rating") or 0.0
-            reviews = poi.get("user_ratings_total") or 0
-            quality = _POI_QUALITY.get(place_type, {"min_rating": 4.4, "min_reviews": 50})
-            if rating < quality["min_rating"] or reviews < quality["min_reviews"]:
-                continue
+        for batch_cats, type_override in batches:
+            pois = geo_client.get_pois(point["lat"], point["lon"], radius_m, batch_cats)
+            for poi in pois:
+                pid = poi.get("place_id", "")
+                if not pid or pid in seen_place_ids:
+                    continue
+                place_type = type_override or poi.get("type", "")
+                if place_type in _POI_BLOCKED_TYPES:
+                    continue
 
-            detour = geo_client.detour_km(coordinates, (poi["lat"], poi["lon"]))
-            max_detour = _POI_DETOUR_LIMITS.get(place_type, 12.0)
-            if detour > max_detour:
-                continue
+                rating = poi.get("rating") or 0.0
+                reviews = poi.get("user_ratings_total") or 0
+                quality = _POI_QUALITY.get(place_type, {"min_rating": 4.4, "min_reviews": 50})
+                if rating < quality["min_rating"] or reviews < quality["min_reviews"]:
+                    continue
 
-            closest_km = _closest_km((poi["lat"], poi["lon"]), coordinates, total_km)
-            seen_place_ids.add(pid)
-            candidates.append({
-                "place_id": pid,
-                "name": poi["name"],
-                "type": place_type,
-                "lat": poi["lat"],
-                "lon": poi["lon"],
-                "km_from_origin": closest_km,
-                "eta_minutes": _eta(closest_km, total_km, total_minutes),
-                "detour_km": round(detour, 1),
-                "rating": rating,
-                "user_ratings_total": reviews,
-            })
+                detour = geo_client.detour_km(coordinates, (poi["lat"], poi["lon"]))
+                max_detour = _POI_DETOUR_LIMITS.get(place_type, 12.0)
+                if detour > max_detour:
+                    continue
+
+                closest_km = _closest_km((poi["lat"], poi["lon"]), coordinates, total_km)
+                seen_place_ids.add(pid)
+                candidates.append({
+                    "place_id": pid,
+                    "name": poi["name"],
+                    "type": place_type,
+                    "lat": poi["lat"],
+                    "lon": poi["lon"],
+                    "km_from_origin": closest_km,
+                    "eta_minutes": _eta(closest_km, total_km, total_minutes),
+                    "detour_km": round(detour, 1),
+                    "rating": rating,
+                    "user_ratings_total": reviews,
+                })
 
         km += sample_interval_km
 
@@ -152,6 +165,8 @@ class RoutePlannerSkill(BaseSkill):
         "action=poi_search: buscar pontos de interesse ao longo da rota já calculada — "
         "usar quando o usuário perguntar o que tem no caminho, quiser explorar paradas "
         "ou pedir sugestões de lugares. Não requer nova origem/destino. "
+        "Categorias disponíveis: natureza, gastronomia regional, cultura, adrenalina, cafeteria premium. "
+        "'cafeteria premium' aplica critérios mais rígidos (nota ≥ 4.6, avaliações ≥ 100, desvio ≤ 4km). "
         "action=add_pois: inserir POIs escolhidos pelo usuário na rota existente — "
         "usar quando o usuário confirmar quais pontos quer adicionar após o poi_search. "
         "Para add_pois, passar OBRIGATORIAMENTE o campo 'indices' com lista de inteiros "
@@ -388,7 +403,7 @@ class RoutePlannerSkill(BaseSkill):
         origin_str = cached.get("origin", "")
         destination_str = cached.get("destination", "")
 
-        raw_categories = args.get("categories") or ["natureza", "gastronomia regional", "cultura", "adrenalina"]
+        raw_categories = args.get("categories") or args.get("category") or ["natureza", "gastronomia regional", "cultura", "adrenalina"]
         if isinstance(raw_categories, str):
             raw_categories = [raw_categories]
         sample_interval_km = float(args.get("sample_interval_km") or _POI_SAMPLE_INTERVAL_KM)
@@ -660,6 +675,7 @@ _POI_TYPE_LABEL = {
     "natural_feature": "🌿 Natureza",
     "restaurant":      "🍽️ Gastronomia",
     "cafe":            "☕ Gastronomia",
+    "cafe_premium":    "☕ Cafeteria Premium",
     "museum":          "🏛️ Cultura",
     "amusement_park":  "🏁 Adrenalina",
     "park":            "🌳 Natureza",
@@ -669,6 +685,7 @@ _POI_ICONS = {
     "restaurant": "🍽️",
     "fuel": "⛽",
     "cafe": "☕",
+    "cafe_premium": "☕",
     "hotel": "🏨",
     "pharmacy": "💊",
     "park": "🌳",

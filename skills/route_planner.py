@@ -696,9 +696,12 @@ def _maps_link(origin: str, destination: str, stops: list[dict]) -> tuple[str, i
     fixed = [s for s in stops if s["type"] == "waypoint_fixed"]
     fuel = [s for s in stops if s["type"] == "fuel"]
     pois = [s for s in stops if s["type"] == "poi_fixed"]
-    all_wp = fixed + fuel + pois
-    waypoints = all_wp[:_MAPS_MAX_WAYPOINTS]
-    pois_omitted_from_link = max(0, len(pois) - max(0, _MAPS_MAX_WAYPOINTS - len(fixed) - len(fuel)))
+    # prioridade de inclusão: fixed+fuel primeiro, POIs nas vagas restantes
+    priority = sorted(fixed + fuel, key=lambda s: s["km_from_origin"])
+    remaining = _MAPS_MAX_WAYPOINTS - len(priority)
+    selected_pois = sorted(pois, key=lambda s: s["km_from_origin"])[:max(0, remaining)]
+    waypoints = sorted(priority + selected_pois, key=lambda s: s["km_from_origin"])
+    pois_omitted_from_link = max(0, len(pois) - len(selected_pois))
     wp_param = ""
     if waypoints:
         wp_str = "|".join(f"{s['lat']},{s['lon']}" for s in waypoints)

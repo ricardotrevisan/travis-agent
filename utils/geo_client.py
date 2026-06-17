@@ -32,6 +32,11 @@ _CATEGORY_PLACES: dict[str, str] = {
     "praia": "natural_feature",
     "mirante": "natural_feature",
     "visual panoramico": "natural_feature",
+    "natureza": "natural_feature",
+    "cachoeira": "natural_feature",
+    "gastronomia regional": "restaurant",
+    "cultura": "museum",
+    "adrenalina": "amusement_park",
 }
 
 
@@ -185,7 +190,16 @@ def get_pois(
                 seen.add(name)
                 loc = r.get("geometry", {}).get("location", {})
                 has_brand = any(term in name.lower() for term in _FUEL_NAME_ALLOWLIST)
-                pois.append({"name": name, "type": place_type, "lat": loc.get("lat"), "lon": loc.get("lng"), "has_brand": has_brand, "place_id": r.get("place_id", "")})
+                pois.append({
+                    "name": name,
+                    "type": place_type,
+                    "lat": loc.get("lat"),
+                    "lon": loc.get("lng"),
+                    "has_brand": has_brand,
+                    "place_id": r.get("place_id", ""),
+                    "rating": r.get("rating"),
+                    "user_ratings_total": r.get("user_ratings_total"),
+                })
         except Exception:
             continue
     return pois

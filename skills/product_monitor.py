@@ -81,7 +81,9 @@ class ProductMonitorSkill(BaseSkill):
 
     def _targets(self, args: dict[str, Any]) -> list[MonitorTarget]:
         size = (args.get("size") or DEFAULT_SIZE).strip()
-        return [pants_target(size), windscreen_target()]
+        # Calça Halo: config preservada (sites, termos, referência) mas fora do monitoramento por ora.
+        targets = [pants_target(size, enabled=False), windscreen_target()]
+        return [t for t in targets if t.enabled]
 
     def run(self, ctx: RequestContext, args: dict[str, Any]) -> SkillResult:
         try:

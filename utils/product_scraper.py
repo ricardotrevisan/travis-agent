@@ -153,6 +153,7 @@ class MonitorTarget:
     criterion: str = "size"  # "size" | "name"
     variant: str = ""  # tamanho (5G) quando criterion="size"
     reference: str = ""  # part number desejável (A9708606), nunca obrigatório
+    enabled: bool = True  # False = config preservada, mas fora do monitoramento ativo
 
     @property
     def variant_label(self) -> str:
@@ -312,7 +313,7 @@ class ProductScraper:
 # ---------------------------------------------------------------------------
 # Alvos concretos monitorados.
 # ---------------------------------------------------------------------------
-def pants_target(size: str) -> MonitorTarget:
+def pants_target(size: str, enabled: bool = True) -> MonitorTarget:
     """Calça Alpinestars Halo Preta, validada por tamanho."""
     return MonitorTarget(
         name="Calça AlpineStars Halo Preta",
@@ -322,6 +323,7 @@ def pants_target(size: str) -> MonitorTarget:
         excluded_terms=_EXCLUDED_PRODUCT_TERMS,
         criterion="size",
         variant=size,
+        enabled=enabled,
     )
 
 

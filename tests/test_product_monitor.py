@@ -2,7 +2,12 @@ import unittest
 
 from runtime.models import RequestContext
 from skills.product_monitor import DEFAULT_QUERY, DEFAULT_SIZE, ProductMonitorSkill
-from utils.product_scraper import MONITORED_SITES, ProductScraper, windscreen_target
+from utils.product_scraper import (
+    MONITORED_SITES,
+    ProductScraper,
+    pants_target,
+    windscreen_target,
+)
 
 _CTX = RequestContext(
     sender="5511975196655@s.whatsapp.net",
@@ -77,7 +82,14 @@ def _make_skill(serper, jina, playwright_fetcher=None) -> ProductMonitorSkill:
         # Sem fallback real nos testes, salvo quando um fake é injetado.
         use_playwright_fallback=playwright_fetcher is not None,
     )
-    return ProductMonitorSkill(scraper=scraper)
+    skill = ProductMonitorSkill(scraper=scraper)
+    # Calça Halo está desativada em produção (ver _targets), mas os testes abaixo
+    # cobrem suas regras de matching, então a religamos explicitamente aqui.
+    skill._targets = lambda args: [
+        pants_target((args.get("size") or DEFAULT_SIZE).strip(), enabled=True),
+        windscreen_target(),
+    ]
+    return skill
 
 
 def _pants_results(output) -> list:
